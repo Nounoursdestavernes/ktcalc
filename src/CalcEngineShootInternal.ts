@@ -128,8 +128,36 @@ export function calcDamage(
   normSaves: number,
 ): DamageResult {
   const originalCritHits = critHits;
-  let damage = critHits * attacker.mwx;
+  const mwxDamage = critHits * attacker.mwx;
+  const resolve = (crits: number, norms: number) =>
+    calcDamageAfterJas(attacker, defender, originalCritHits, mwxDamage, crits, norms, critSaves, normSaves);
+
+  // Just a Scratch cancels one hit before saves. Which one is best depends on what the saves can
+  // then block and on Durable, so try each hit type and keep the lowest damage. On equal damage,
+  // prefer cancelling the type with more per-die damage (crits on a tie). MWx was already counted
+  // from the original crits, so cancelling a crit only ever removes critDmg.
+  if (defender.has(Ability.JustAScratch) && critHits + normHits > 0) {
+    const options: DamageResult[] = [];
+    if (critHits > 0) options.push(resolve(critHits - 1, normHits));
+    if (normHits > 0) options.push(resolve(critHits, normHits - 1));
+    if (attacker.critDmg < attacker.normDmg) options.reverse();
+    return options.reduce((best, r) => (r.damage < best.damage ? r : best));
+  }
+  return resolve(critHits, normHits);
+}
+
+function calcDamageAfterJas(
+  attacker: Model,
+  defender: Model,
+  originalCritHits: number,
+  mwxDamage: number,
+  critHits: number,
+  normHits: number,
+  critSaves: number,
+  normSaves: number,
+): DamageResult {
   const numNormalSavesToCancelCritHit = 2; // for Kill Team rules, not Fire Team rules
+  const durableApplies = defender.has(Ability.Durable) && attacker.critDmg > MinCritDmgAfterDurable;
 
   function critSavesCancelCritHits() {
     const numCancels = Math.min(critSaves, critHits);
@@ -152,19 +180,16 @@ export function calcDamage(
     critHits -= numCancels;
   }
 
-  if (defender.has(Ability.JustAScratch)) {
-    if (critHits > 0) {
-      critHits--;
-    } else if (normHits > 0) {
-      normHits--;
-    }
-  }
-
   if (defender.has(Ability.JustAScratchNorms)) {
     if (normHits > 0) {
       normHits--;
     }
   }
+
+  const initialCritHits = critHits;
+  const initialNormHits = normHits;
+  const initialCritSaves = critSaves;
+  const initialNormSaves = normSaves;
 
   if (attacker.critDmg >= attacker.normDmg) {
     critSavesCancelCritHits();
@@ -194,20 +219,43 @@ export function calcDamage(
     normSavesCancelCritHits();
   }
 
-  damage += critHits * attacker.critDmg + normHits * attacker.normDmg;
-  // Only damaging hits get FNP rolls; zero-damage hits must not reduce other hits.
-  // Cancelled crits still count if MWx contributed damage.
-  const mwxCancelledCrits = attacker.mwx > 0 ? (originalCritHits - critHits) : 0;
-  const damagingCrits = attacker.critDmg + attacker.mwx > 0 ? critHits : 0;
-  const damagingNorms = attacker.normDmg > 0 ? normHits : 0;
-  const numHits = damagingCrits + damagingNorms + mwxCancelledCrits;
+  const greedy = damageFromSurvivors(critHits, normHits);
+  if (!durableApplies) {
+    return greedy;
+  }
 
-  // TODO: make the above decisions take Durable into account
-  const durableCritReduction =
-    defender.has(Ability.Durable) && attacker.critDmg > MinCritDmgAfterDurable && critHits > 0 ? 1 : 0;
-  damage -= durableCritReduction;
+  // The greedy order above ignores Durable, which takes 1 off a surviving crit. That can make a
+  // different split better, e.g. equal dmgs with 1ch 1nh vs 1cs: saving the norm leaves a shaved
+  // crit. So try every split of the saves and keep one only if it is strictly better, leaving
+  // equal-damage cases as the greedy order chose them. Using spare saves never hurts, so only the
+  // crit-saves-on-crits and norm-saves-on-norms counts need searching.
+  let best = greedy;
+  for (let cscc = 0; cscc <= Math.min(initialCritSaves, initialCritHits); cscc++) {
+    const cscn = Math.min(initialCritSaves - cscc, initialNormHits);
+    for (let nsnn = 0; nsnn <= Math.min(initialNormSaves, initialNormHits - cscn); nsnn++) {
+      const nscc = Math.min(
+        ((initialNormSaves - nsnn) / numNormalSavesToCancelCritHit) >> 0,
+        initialCritHits - cscc,
+      );
+      const candidate = damageFromSurvivors(initialCritHits - cscc - nscc, initialNormHits - cscn - nsnn);
+      if (candidate.damage < best.damage) {
+        best = candidate;
+      }
+    }
+  }
+  return best;
 
-  return { damage, numHits, survivingCritHits: critHits, survivingNormHits: normHits, durableCritReduction };
+  function damageFromSurvivors(critHits: number, normHits: number): DamageResult {
+    // Only damaging hits get FNP rolls; zero-damage hits must not reduce other hits.
+    // Cancelled crits still count if MWx contributed damage.
+    const mwxCancelledCrits = attacker.mwx > 0 ? (originalCritHits - critHits) : 0;
+    const damagingCrits = attacker.critDmg + attacker.mwx > 0 ? critHits : 0;
+    const damagingNorms = attacker.normDmg > 0 ? normHits : 0;
+    const numHits = damagingCrits + damagingNorms + mwxCancelledCrits;
+    const durableCritReduction = durableApplies && critHits > 0 ? 1 : 0;
+    const damage = mwxDamage + critHits * attacker.critDmg + normHits * attacker.normDmg - durableCritReduction;
+    return { damage, numHits, survivingCritHits: critHits, survivingNormHits: normHits, durableCritReduction };
+  }
 }
 
 // SaintlyRelics: whenever an attack dice would inflict damage, the defender may roll to ignore
